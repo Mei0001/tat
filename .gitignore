@@ -1,0 +1,10 @@
+node_modules/
+.next/
+.env.local
+.vercel/
+*.log
+coverage/
+tsconfig.tsbuildinfo
+
+# Local progress logs (per Codex review P3)
+claude-progress.txt

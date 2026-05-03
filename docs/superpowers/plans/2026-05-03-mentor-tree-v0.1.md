@@ -423,9 +423,9 @@ create table public.tree_nodes (
   user_id uuid not null references auth.users(id) on delete cascade,
   parent_id uuid references public.tree_nodes(id) on delete cascade,
   axis_id uuid references public.framework_axes(id) on delete set null,
-  node_type text not null check (node_type in ('goal','sub_goal','method','task','question','answer')),
+  node_type text not null check (node_type in ('goal','sub_goal','method','task')),
   label text not null check (length(label) between 1 and 280),
-  status text not null default 'pending' check (status in ('pending','active','completed','skipped','waiting')),
+  status text not null default 'pending' check (status in ('pending','active','completed','skipped')),
   depth smallint not null check (depth between 0 and 4),
   position smallint not null default 0,
   metadata jsonb not null default '{}'::jsonb,
@@ -437,11 +437,32 @@ create index idx_tree_nodes_goal on public.tree_nodes(goal_id) where deleted_at 
 create index idx_tree_nodes_parent on public.tree_nodes(parent_id) where deleted_at is null;
 create index idx_tree_nodes_user on public.tree_nodes(user_id) where deleted_at is null;
 
+-- ---------- hearing_nodes ----------
+-- spec: ヒアリングは tree_nodes と別集約。question/answer のみ。
+create table public.hearing_nodes (
+  id uuid primary key default uuid_generate_v4(),
+  goal_id uuid not null references public.goals(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  parent_id uuid references public.hearing_nodes(id) on delete cascade,
+  axis_id uuid references public.framework_axes(id) on delete set null,
+  node_type text not null check (node_type in ('question','answer')),
+  label text not null check (length(label) between 1 and 500),
+  status text not null default 'pending' check (status in ('pending','active','answered','skipped')),
+  metadata jsonb not null default '{}'::jsonb,
+  sort_order int not null default 0,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  deleted_at timestamptz
+);
+create index idx_hearing_nodes_goal on public.hearing_nodes(goal_id) where deleted_at is null;
+create index idx_hearing_nodes_parent on public.hearing_nodes(parent_id) where deleted_at is null;
+create index idx_hearing_nodes_user on public.hearing_nodes(user_id) where deleted_at is null;
+
 -- ---------- task_logs ----------
 create table public.task_logs (
   id uuid primary key default uuid_generate_v4(),
   user_id uuid not null references auth.users(id) on delete cascade,
-  task_node_id uuid not null references public.tree_nodes(id) on delete cascade,
+  node_id uuid not null references public.tree_nodes(id) on delete cascade,
   completed_at timestamptz not null default now(),
   day_start_hour_at_completion smallint not null check (day_start_hour_at_completion between 0 and 23),
   timezone_at_completion text not null,
@@ -452,8 +473,9 @@ create table public.task_logs (
   created_at timestamptz not null default now()
 );
 create unique index idx_task_logs_unique_per_day
-  on public.task_logs(user_id, task_node_id, completed_on);
+  on public.task_logs(user_id, node_id, completed_on);
 create index idx_task_logs_user_date on public.task_logs(user_id, completed_on desc);
+create index idx_task_logs_node on public.task_logs(node_id);
 
 -- ---------- ai_call_logs ----------
 create table public.ai_call_logs (
@@ -488,6 +510,8 @@ create trigger trg_framework_axes_updated_at before update on public.framework_a
   for each row execute function public.touch_updated_at();
 create trigger trg_tree_nodes_updated_at before update on public.tree_nodes
   for each row execute function public.touch_updated_at();
+create trigger trg_hearing_nodes_updated_at before update on public.hearing_nodes
+  for each row execute function public.touch_updated_at();
 
 -- ---------- aggregate boundary trigger ----------
 create or replace function public.enforce_tree_node_aggregate()
@@ -517,6 +541,49 @@ create trigger trg_tree_nodes_aggregate
   before insert or update on public.tree_nodes
   for each row execute function public.enforce_tree_node_aggregate();
 
+-- ---------- hearing_nodes invariants ----------
+-- 親が question のときだけ answer を許す等の不変条件を DB 側でも担保。
+create or replace function public.enforce_hearing_node_invariants()
+returns trigger language plpgsql as $$
+declare
+  parent_user uuid;
+  parent_goal uuid;
+  parent_type text;
+begin
+  if new.parent_id is not null then
+    select user_id, goal_id, node_type
+      into parent_user, parent_goal, parent_type
+      from public.hearing_nodes where id = new.parent_id;
+    if parent_user is null then
+      raise exception 'parent hearing_node not found';
+    end if;
+    if parent_user <> new.user_id then
+      raise exception 'hearing_node user mismatch with parent';
+    end if;
+    if parent_goal <> new.goal_id then
+      raise exception 'hearing_node goal mismatch with parent';
+    end if;
+    -- answer は必ず question の子。question の子は answer のみ。
+    if new.node_type = 'answer' and parent_type <> 'question' then
+      raise exception 'answer must have a question parent';
+    end if;
+    if new.node_type = 'question' and parent_type = 'question' then
+      raise exception 'question cannot directly nest under another question';
+    end if;
+  else
+    -- ルートは question のみ（answer 単独存在を禁止）。
+    if new.node_type = 'answer' then
+      raise exception 'answer cannot be a root node';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger trg_hearing_nodes_invariants
+  before insert or update on public.hearing_nodes
+  for each row execute function public.enforce_hearing_node_invariants();
+
 -- ---------- logical date helper ----------
 create or replace function public.current_logical_date(p_user_id uuid)
 returns date language sql stable as $$
@@ -526,6 +593,40 @@ returns date language sql stable as $$
   )::date
   from public.profiles p
   where p.id = p_user_id and p.deleted_at is null;
+$$;
+
+-- ---------- create_goal_with_axes RPC (atomic) ----------
+-- goals INSERT 後 framework_axes bulk INSERT を 1 トランザクションで行う。
+-- 途中で失敗した場合は両方 rollback され、片方だけ存在する不整合を防ぐ。
+create or replace function public.create_goal_with_axes(
+  p_user_id uuid,
+  p_label text,
+  p_description text,
+  p_framework_template text,
+  p_axes jsonb
+)
+returns public.goals language plpgsql security invoker as $$
+declare
+  inserted public.goals;
+  axis jsonb;
+begin
+  insert into public.goals (user_id, label, description, framework_template)
+  values (p_user_id, p_label, p_description, p_framework_template)
+  returning * into inserted;
+
+  for axis in select * from jsonb_array_elements(p_axes)
+  loop
+    insert into public.framework_axes (goal_id, user_id, name, position)
+    values (
+      inserted.id,
+      p_user_id,
+      axis ->> 'name',
+      (axis ->> 'position')::int
+    );
+  end loop;
+
+  return inserted;
+end;
 $$;
 
 -- ---------- profile auto-create on signup ----------
@@ -559,6 +660,7 @@ alter table public.profiles enable row level security;
 alter table public.goals enable row level security;
 alter table public.framework_axes enable row level security;
 alter table public.tree_nodes enable row level security;
+alter table public.hearing_nodes enable row level security;
 alter table public.task_logs enable row level security;
 alter table public.ai_call_logs enable row level security;
 
@@ -603,6 +705,21 @@ create policy tree_nodes_owner on public.tree_nodes
   )
   with check (user_id = auth.uid());
 
+-- hearing_nodes: goal 経由で非削除確認
+create policy hearing_nodes_owner on public.hearing_nodes
+  for all
+  using (
+    user_id = auth.uid()
+    and deleted_at is null
+    and exists (
+      select 1 from public.goals g
+      where g.id = hearing_nodes.goal_id
+        and g.user_id = auth.uid()
+        and g.deleted_at is null
+    )
+  )
+  with check (user_id = auth.uid());
+
 -- task_logs: 親ツリーノードと goal の非削除を確認
 create policy task_logs_owner on public.task_logs
   for all
@@ -611,7 +728,7 @@ create policy task_logs_owner on public.task_logs
     and exists (
       select 1 from public.tree_nodes n
       join public.goals g on g.id = n.goal_id
-      where n.id = task_logs.task_node_id
+      where n.id = task_logs.node_id
         and n.user_id = auth.uid()
         and n.deleted_at is null
         and g.deleted_at is null
@@ -728,8 +845,6 @@ export const NodeType = {
   SubGoal: 'sub_goal',
   Method: 'method',
   Task: 'task',
-  Question: 'question',
-  Answer: 'answer',
 } as const;
 export type NodeType = (typeof NodeType)[keyof typeof NodeType];
 ```
@@ -742,9 +857,31 @@ export const NodeStatus = {
   Active: 'active',
   Completed: 'completed',
   Skipped: 'skipped',
-  Waiting: 'waiting',
 } as const;
 export type NodeStatus = (typeof NodeStatus)[keyof typeof NodeStatus];
+```
+
+`src/domain/enums/hearing-node-type.ts`:
+
+```ts
+export const HearingNodeType = {
+  Question: 'question',
+  Answer: 'answer',
+} as const;
+export type HearingNodeType =
+  (typeof HearingNodeType)[keyof typeof HearingNodeType];
+```
+
+`src/domain/enums/hearing-status.ts`:
+
+```ts
+export const HearingStatus = {
+  Pending: 'pending',
+  Active: 'active',
+  Answered: 'answered',
+  Skipped: 'skipped',
+} as const;
+export type HearingStatus = (typeof HearingStatus)[keyof typeof HearingStatus];
 ```
 
 `src/domain/enums/question-status.ts`:
@@ -1152,6 +1289,20 @@ describe('TaskLog', () => {
     expect(log.props.completedOn).toBe('2026-05-03');
   });
 
+  it('completedOn は YYYY-MM-DD 形式である', () => {
+    const log = TaskLog.reconstruct(baseProps);
+    expect(log.props.completedOn).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  });
+
+  it('completedOn が YYYY-MM-DD 形式でなければ DomainError', () => {
+    expect(() =>
+      TaskLog.reconstruct({ ...baseProps, completedOn: '2026/05/03' })
+    ).toThrow(DomainError);
+    expect(() =>
+      TaskLog.reconstruct({ ...baseProps, completedOn: '2026-5-3' })
+    ).toThrow(DomainError);
+  });
+
   it('day_start_hour 範囲外は DomainError', () => {
     expect(() =>
       TaskLog.reconstruct({ ...baseProps, dayStartHourAtCompletion: 24 })
@@ -1180,6 +1331,8 @@ export interface TaskLogProps {
   createdAt: Date;
 }
 
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
 export class TaskLog {
   private constructor(public readonly props: TaskLogProps) {}
   static reconstruct(props: TaskLogProps): TaskLog {
@@ -1190,13 +1343,20 @@ export class TaskLog {
     ) {
       throw new DomainError('TaskLog.dayStartHourAtCompletion must be 0-23');
     }
+    // completed_on は DB 側で STORED 列だが、reconstruct 時に妥当性を再確認する。
+    // 値が壊れていれば Repository マッパーのバグなのでドメイン層で fail-fast。
+    if (!ISO_DATE_RE.test(props.completedOn)) {
+      throw new DomainError(
+        `TaskLog.completedOn must be YYYY-MM-DD: got ${props.completedOn}`
+      );
+    }
     return new TaskLog(props);
   }
 }
 ```
 
 Run: `pnpm test tests/domain/entities/task-log.test.ts`
-Expected: PASS（2 件）。
+Expected: PASS（4 件）。
 
 - [ ] **Step 2.11: Metadata Zod スキーマを書く**
 
@@ -1298,9 +1458,16 @@ export function createSupabaseServerClient() {
       cookies: {
         getAll: () => cookieStore.getAll(),
         setAll: (cookiesToSet) => {
-          cookiesToSet.forEach(({ name, value, options }) => {
-            cookieStore.set(name, value, options);
-          });
+          // Server Component から呼ばれたときは Next.js が cookies().set を禁止して
+          // 例外を投げる。Route Handler / Server Action / Middleware では成功する。
+          // セッションリフレッシュは middleware.ts が担うので、ここでは握りつぶして OK。
+          try {
+            cookiesToSet.forEach(({ name, value, options }) => {
+              cookieStore.set(name, value, options);
+            });
+          } catch {
+            // ignore: Server Component context
+          }
         },
       },
     }
@@ -1446,11 +1613,30 @@ import { createSupabaseServerClient } from '@/infrastructure/supabase/server-cli
 export async function GET(request: NextRequest) {
   const { searchParams, origin } = new URL(request.url);
   const code = searchParams.get('code');
+  const errorCode = searchParams.get('error');
+  const errorDescription = searchParams.get('error_description');
+
+  // Magic Link が期限切れ・不正な場合は ?error=... が付く。
+  // 黙って /goals に飛ばすと「ログインしたつもりが未認証」になり middleware で /login に戻され混乱するので
+  // ?error= を保持して /login に戻す。
+  if (errorCode) {
+    const url = new URL(`${origin}/login`);
+    url.searchParams.set('error', errorDescription ?? errorCode);
+    return NextResponse.redirect(url);
+  }
 
   if (code) {
     const supabase = createSupabaseServerClient();
-    await supabase.auth.exchangeCodeForSession(code);
+    const { error } = await supabase.auth.exchangeCodeForSession(code);
+    if (error) {
+      const url = new URL(`${origin}/login`);
+      url.searchParams.set('error', error.message);
+      return NextResponse.redirect(url);
+    }
+  } else {
+    return NextResponse.redirect(`${origin}/login?error=missing_code`);
   }
+
   return NextResponse.redirect(`${origin}/goals`);
 }
 ```
@@ -1543,8 +1729,29 @@ export interface CreateGoalInput {
   frameworkTemplate: string;
 }
 
+export interface CreateGoalWithAxesInput {
+  userId: string;
+  label: string;
+  description: string | null;
+  frameworkTemplate: string;
+  axes: ReadonlyArray<{ name: string; position: number }>;
+}
+
 export interface GoalRepository {
+  /**
+   * 単純な goals insert のみ。framework_axes が不要なケース用。
+   * トランザクション境界を持たないため、複数テーブル書き込みには
+   * createWithAxes を使う。
+   */
   create(input: CreateGoalInput): Promise<Goal>;
+
+  /**
+   * goals + framework_axes を単一トランザクションで作成。
+   * Postgres の create_goal_with_axes RPC を呼び出し、途中失敗時は
+   * 全てロールバックされる（part of I2 fix）。
+   */
+  createWithAxes(input: CreateGoalWithAxesInput): Promise<Goal>;
+
   findByUser(userId: string): Promise<Goal[]>;
   findById(id: string, userId: string): Promise<Goal | null>;
 }
@@ -1576,11 +1783,11 @@ export interface FrameworkAxisRepository {
 import { describe, expect, it, vi } from 'vitest';
 import { createGoalFromPreset } from '@/application/usecases/create-goal-from-preset';
 import type { GoalRepository } from '@/application/interfaces/goal-repository';
-import type { FrameworkAxisRepository } from '@/application/interfaces/framework-axis-repository';
 import { Goal } from '@/domain/entities/goal';
 import { GoalId } from '@/domain/value-objects/goal-id';
 import { GoalLabel } from '@/domain/value-objects/goal-label';
 import { UserId } from '@/domain/value-objects/user-id';
+import { DEFAULT_FRAMEWORK_AXES } from '@/shared/constants/frameworks';
 
 const VALID_GOAL_ID = '00000000-0000-7000-8000-000000000010';
 const VALID_USER_ID = '00000000-0000-7000-8000-000000000020';
@@ -1600,15 +1807,12 @@ function makeGoalStub() {
 }
 
 describe('createGoalFromPreset', () => {
-  it('Goal 作成と framework_axes bulkCreate を1回ずつ呼ぶ', async () => {
+  it('createWithAxes をデフォルト軸付きで1回呼ぶ（goal + axes は単一トランザクション）', async () => {
     const goalRepo: GoalRepository = {
-      create: vi.fn().mockResolvedValue(makeGoalStub()),
+      create: vi.fn(),
+      createWithAxes: vi.fn().mockResolvedValue(makeGoalStub()),
       findByUser: vi.fn(),
       findById: vi.fn(),
-    };
-    const axisRepo: FrameworkAxisRepository = {
-      bulkCreate: vi.fn().mockResolvedValue([]),
-      findByGoal: vi.fn(),
     };
 
     const result = await createGoalFromPreset({
@@ -1617,23 +1821,23 @@ describe('createGoalFromPreset', () => {
       description: null,
       presetId: 'preset_default',
       goalRepo,
-      axisRepo,
     });
 
-    expect(goalRepo.create).toHaveBeenCalledOnce();
-    expect(axisRepo.bulkCreate).toHaveBeenCalledOnce();
+    expect(goalRepo.createWithAxes).toHaveBeenCalledOnce();
+    expect(goalRepo.create).not.toHaveBeenCalled();
+    const callArg = (goalRepo.createWithAxes as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(callArg.axes).toEqual(
+      DEFAULT_FRAMEWORK_AXES.map((a) => ({ name: a.name, position: a.position }))
+    );
     expect(result.props.label.value).toBe('英語');
   });
 
-  it('label が空文字なら DomainError', async () => {
+  it('label が空文字なら DomainError、createWithAxes は呼ばれない', async () => {
     const goalRepo: GoalRepository = {
       create: vi.fn(),
+      createWithAxes: vi.fn(),
       findByUser: vi.fn(),
       findById: vi.fn(),
-    };
-    const axisRepo: FrameworkAxisRepository = {
-      bulkCreate: vi.fn(),
-      findByGoal: vi.fn(),
     };
 
     await expect(
@@ -1643,10 +1847,9 @@ describe('createGoalFromPreset', () => {
         description: null,
         presetId: 'preset_default',
         goalRepo,
-        axisRepo,
       })
     ).rejects.toThrow();
-    expect(goalRepo.create).not.toHaveBeenCalled();
+    expect(goalRepo.createWithAxes).not.toHaveBeenCalled();
   });
 });
 ```
@@ -1659,7 +1862,6 @@ Expected: FAIL（モジュール未作成）
 `src/application/usecases/create-goal-from-preset.ts`:
 
 ```ts
-import type { FrameworkAxisRepository } from '@/application/interfaces/framework-axis-repository';
 import type { GoalRepository } from '@/application/interfaces/goal-repository';
 import type { Goal } from '@/domain/entities/goal';
 import { GoalLabel } from '@/domain/value-objects/goal-label';
@@ -1672,29 +1874,31 @@ export interface CreateGoalFromPresetInput {
   description: string | null;
   presetId: GoalPresetId;
   goalRepo: GoalRepository;
-  axisRepo: FrameworkAxisRepository;
 }
 
+/**
+ * goal + framework_axes を単一トランザクションで作成する。
+ *
+ * 旧実装は goalRepo.create → axisRepo.bulkCreate の sequential 呼び出しで、
+ * 軸作成だけ失敗すると軸のない goal が残る不整合があった（I2 fix）。
+ * 新実装は createWithAxes (Postgres RPC create_goal_with_axes) を使い、
+ * いずれかが失敗したら全体ロールバックする。
+ */
 export async function createGoalFromPreset(
   input: CreateGoalFromPresetInput
 ): Promise<Goal> {
   const validatedLabel = GoalLabel.create(input.label);
 
-  const goal = await input.goalRepo.create({
+  const goal = await input.goalRepo.createWithAxes({
     userId: input.userId,
     label: validatedLabel.value,
     description: input.description,
     frameworkTemplate: input.presetId,
-  });
-
-  await input.axisRepo.bulkCreate(
-    DEFAULT_FRAMEWORK_AXES.map((axis) => ({
-      goalId: goal.props.id.value,
-      userId: input.userId,
+    axes: DEFAULT_FRAMEWORK_AXES.map((axis) => ({
       name: axis.name,
       position: axis.position,
-    }))
-  );
+    })),
+  });
 
   return goal;
 }
@@ -1711,6 +1915,7 @@ Expected: PASS（2 件）。
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type {
   CreateGoalInput,
+  CreateGoalWithAxesInput,
   GoalRepository,
 } from '@/application/interfaces/goal-repository';
 import { Goal } from '@/domain/entities/goal';
@@ -1751,6 +1956,26 @@ export class SupabaseGoalRepository implements GoalRepository {
       .single();
     if (error || !data) throw error ?? new Error('insert returned no row');
     return toDomain(data);
+  }
+
+  /**
+   * goals + framework_axes をアトミックに作成する。
+   * Postgres function create_goal_with_axes を呼び、途中失敗時は
+   * 自動ロールバック。RLS は SECURITY INVOKER 経由で適用される。
+   */
+  async createWithAxes(input: CreateGoalWithAxesInput): Promise<Goal> {
+    const { data, error } = await this.db.rpc('create_goal_with_axes', {
+      p_user_id: input.userId,
+      p_label: input.label,
+      p_description: input.description,
+      p_framework_template: input.frameworkTemplate,
+      p_axes: input.axes.map((a) => ({ name: a.name, position: a.position })),
+    });
+    if (error || !data) throw error ?? new Error('rpc returned no row');
+    // RPC は SETOF goals を返すため、Postgrest は配列ではなく単一行を返す（returns_row_type）
+    const row = (Array.isArray(data) ? data[0] : data) as GoalRow;
+    if (!row) throw new Error('create_goal_with_axes returned no row');
+    return toDomain(row);
   }
 
   async findByUser(userId: string): Promise<Goal[]> {
@@ -1851,7 +2076,6 @@ export class SupabaseFrameworkAxisRepository
 import { redirect } from 'next/navigation';
 import { z } from 'zod';
 import { createGoalFromPreset } from '@/application/usecases/create-goal-from-preset';
-import { SupabaseFrameworkAxisRepository } from '@/infrastructure/repositories/supabase-framework-axis-repository';
 import { SupabaseGoalRepository } from '@/infrastructure/repositories/supabase-goal-repository';
 import { createSupabaseServerClient } from '@/infrastructure/supabase/server-client';
 
@@ -1877,15 +2101,15 @@ export async function createGoalAction(formData: FormData) {
   if (!user) return { error: 'Unauthorized' };
 
   const goalRepo = new SupabaseGoalRepository(supabase);
-  const axisRepo = new SupabaseFrameworkAxisRepository(supabase);
 
+  // axisRepo は不要。createGoalFromPreset 内で goalRepo.createWithAxes が
+  // RPC 経由で goals + framework_axes をアトミック作成する（I2 fix）
   const goal = await createGoalFromPreset({
     userId: user.id,
     label: parsed.data.label,
     description: parsed.data.description ?? null,
     presetId: parsed.data.presetId,
     goalRepo,
-    axisRepo,
   });
 
   redirect(`/hearing/${goal.props.id.value}`);
@@ -2018,17 +2242,19 @@ git commit -m "feat(goals): add preset goal creation with framework axes"
 
 **Files:**
 - Create: `src/infrastructure/mocks/question-bank.ts`
+- Create: `src/domain/entities/hearing-node.ts`
 - Create: `src/application/interfaces/hearing-node-repository.ts`
 - Create: `src/application/usecases/start-hearing.ts`
 - Create: `src/application/usecases/record-hearing-answer.ts`
 - Create: `src/application/usecases/complete-hearing.ts`
 - Create: `src/infrastructure/repositories/supabase-hearing-node-repository.ts`
-- Create: `src/presentation/components/HearingCard.tsx`
 - Create: `src/presentation/actions/hearing.action.ts`
 - Create: `src/app/hearing/[goalId]/page.tsx`
+- Test: `tests/domain/entities/hearing-node.test.ts`
 - Test: `tests/application/usecases/start-hearing.test.ts`
+- Test: `tests/application/usecases/record-hearing-answer.test.ts`
 
-設計上の注意: v0.1 ではヒアリングの質問・回答を `tree_nodes` の `node_type='question'`/`'answer'` として永続化する。`HearingNode` Entity は v0.1 では使わず、ヒアリング用の TreeNode を直接 CRUD する（spec 完全復元方針に従う）。
+設計上の注意: spec のとおり、ヒアリングは `tree_nodes` ではなく `hearing_nodes` 集約に永続化する。`tree_nodes` には `goal/sub_goal/method/task` のみを格納し、question/answer は `hearing_nodes` に閉じる。所有権境界は `hearing_node_repository.findById(id, userId)` 経由で検証する。
 
 - [ ] **Step 5.1: モック質問バンクを定義**
 
@@ -2050,97 +2276,189 @@ export const MOCK_HEARING_QUESTIONS: readonly MockQuestion[] = [
 ] as const;
 ```
 
-- [ ] **Step 5.2: TreeNode Repository インターフェースを定義**
+- [ ] **Step 5.2: HearingNode Entity のテストを書く**
 
-`src/application/interfaces/tree-node-repository.ts`:
+`tests/domain/entities/hearing-node.test.ts`:
 
 ```ts
-import type { TreeNode } from '@/domain/entities/tree-node';
-import type { NodeStatus } from '@/domain/enums/node-status';
-import type { NodeType } from '@/domain/enums/node-type';
+import { describe, expect, it } from 'vitest';
+import { HearingNode } from '@/domain/entities/hearing-node';
+import { HearingNodeType } from '@/domain/enums/hearing-node-type';
+import { HearingStatus } from '@/domain/enums/hearing-status';
+import { DomainError } from '@/shared/errors/domain-error';
 
-export interface CreateTreeNodeInput {
+const baseProps = {
+  id: '00000000-0000-7000-8000-000000000001',
+  goalId: '00000000-0000-7000-8000-000000000010',
+  userId: '00000000-0000-7000-8000-000000000020',
+  parentId: null as string | null,
+  axisId: null as string | null,
+  nodeType: HearingNodeType.Question,
+  label: '今のスキルレベルは？',
+  status: HearingStatus.Pending,
+  metadata: {},
+  sortOrder: 0,
+  createdAt: new Date(),
+  updatedAt: new Date(),
+  deletedAt: null as Date | null,
+};
+
+describe('HearingNode', () => {
+  it('正常な値で reconstruct できる', () => {
+    const node = HearingNode.reconstruct(baseProps);
+    expect(node.props.nodeType).toBe('question');
+  });
+
+  it('answer は parentId が必須', () => {
+    expect(() =>
+      HearingNode.reconstruct({
+        ...baseProps,
+        nodeType: HearingNodeType.Answer,
+        parentId: null,
+      })
+    ).toThrow(DomainError);
+  });
+
+  it('label が空文字なら DomainError', () => {
+    expect(() =>
+      HearingNode.reconstruct({ ...baseProps, label: '' })
+    ).toThrow(DomainError);
+  });
+});
+```
+
+Run: `pnpm test tests/domain/entities/hearing-node.test.ts`
+Expected: FAIL（モジュールが存在しない）。
+
+- [ ] **Step 5.3: HearingNode Entity を実装**
+
+`src/domain/entities/hearing-node.ts`:
+
+```ts
+import type { HearingNodeType } from '@/domain/enums/hearing-node-type';
+import type { HearingStatus } from '@/domain/enums/hearing-status';
+import { DomainError } from '@/shared/errors/domain-error';
+
+export interface HearingNodeProps {
+  id: string;
   goalId: string;
   userId: string;
   parentId: string | null;
   axisId: string | null;
-  nodeType: NodeType;
+  nodeType: HearingNodeType;
   label: string;
-  status: NodeStatus;
-  depth: number;
-  position: number;
-  metadata?: Record<string, unknown>;
+  status: HearingStatus;
+  metadata: Record<string, unknown>;
+  sortOrder: number;
+  createdAt: Date;
+  updatedAt: Date;
+  deletedAt: Date | null;
 }
 
-export interface TreeNodeRepository {
-  create(input: CreateTreeNodeInput): Promise<TreeNode>;
-  bulkCreate(inputs: CreateTreeNodeInput[]): Promise<TreeNode[]>;
-  findByGoal(goalId: string): Promise<TreeNode[]>;
-  findById(id: string, userId: string): Promise<TreeNode | null>;
-  updateStatus(id: string, status: NodeStatus): Promise<void>;
-  updateLabel(id: string, label: string): Promise<void>;
+export class HearingNode {
+  private constructor(public readonly props: HearingNodeProps) {}
+
+  static reconstruct(props: HearingNodeProps): HearingNode {
+    if (props.label.trim().length === 0) {
+      throw new DomainError('HearingNode.label cannot be empty');
+    }
+    if (props.label.length > 500) {
+      throw new DomainError('HearingNode.label must be 500 chars or less');
+    }
+    if (props.nodeType === 'answer' && props.parentId === null) {
+      throw new DomainError('HearingNode answer requires parentId');
+    }
+    return new HearingNode(props);
+  }
 }
 ```
 
-- [ ] **Step 5.3: HearingNode 用のクエリインターフェースを足す（v0.1 は TreeNode に集約）**
+Run: `pnpm test tests/domain/entities/hearing-node.test.ts`
+Expected: PASS（3 件）。
 
-ヒアリングは TreeNode の question/answer ノードで表現するため、専用 repository は作らず TreeNodeRepository を流用する。
+- [ ] **Step 5.4: HearingNodeRepository インターフェースを定義**
 
-- [ ] **Step 5.4: StartHearing ユースケースのテストを書く**
+`src/application/interfaces/hearing-node-repository.ts`:
+
+```ts
+import type { HearingNode } from '@/domain/entities/hearing-node';
+import type { HearingNodeType } from '@/domain/enums/hearing-node-type';
+import type { HearingStatus } from '@/domain/enums/hearing-status';
+
+export interface CreateHearingNodeInput {
+  goalId: string;
+  userId: string;
+  parentId: string | null;
+  axisId: string | null;
+  nodeType: HearingNodeType;
+  label: string;
+  status: HearingStatus;
+  sortOrder: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface HearingNodeRepository {
+  bulkCreate(inputs: CreateHearingNodeInput[]): Promise<HearingNode[]>;
+  create(input: CreateHearingNodeInput): Promise<HearingNode>;
+  findByGoal(goalId: string, userId: string): Promise<HearingNode[]>;
+  findById(id: string, userId: string): Promise<HearingNode | null>;
+  updateStatus(input: {
+    id: string;
+    userId: string;
+    status: HearingStatus;
+  }): Promise<void>;
+}
+```
+
+注意: `findByGoal` / `updateStatus` は `userId` を必須引数として受け取り、Repository 実装側で `eq('user_id', userId)` を必ず付ける。RLS と二重防御で他ユーザーの hearing_node を触れない設計にする。
+
+- [ ] **Step 5.5: StartHearing ユースケースのテストを書く**
 
 `tests/application/usecases/start-hearing.test.ts`:
 
 ```ts
 import { describe, expect, it, vi } from 'vitest';
 import { startHearing } from '@/application/usecases/start-hearing';
-import type { TreeNodeRepository } from '@/application/interfaces/tree-node-repository';
+import type { HearingNodeRepository } from '@/application/interfaces/hearing-node-repository';
 import { MOCK_HEARING_QUESTIONS } from '@/infrastructure/mocks/question-bank';
 
 const VALID_GOAL = '00000000-0000-7000-8000-000000000010';
 const VALID_USER = '00000000-0000-7000-8000-000000000020';
 
-describe('startHearing', () => {
-  it('質問数だけ TreeNode を bulkCreate する', async () => {
-    const repo: TreeNodeRepository = {
-      create: vi.fn(),
-      bulkCreate: vi.fn().mockResolvedValue([]),
-      findByGoal: vi.fn().mockResolvedValue([]),
-      findById: vi.fn(),
-      updateStatus: vi.fn(),
-      updateLabel: vi.fn(),
-    };
+function makeRepo(existing: unknown[] = []): HearingNodeRepository {
+  return {
+    create: vi.fn(),
+    bulkCreate: vi.fn().mockResolvedValue([]),
+    findByGoal: vi.fn().mockResolvedValue(existing),
+    findById: vi.fn(),
+    updateStatus: vi.fn(),
+  };
+}
 
+describe('startHearing', () => {
+  it('質問数だけ HearingNode を bulkCreate する', async () => {
+    const repo = makeRepo();
     await startHearing({
       goalId: VALID_GOAL,
       userId: VALID_USER,
-      treeNodeRepo: repo,
+      hearingNodeRepo: repo,
     });
 
     expect(repo.bulkCreate).toHaveBeenCalledOnce();
     const passed = (repo.bulkCreate as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(passed).toHaveLength(MOCK_HEARING_QUESTIONS.length);
     expect(passed[0].nodeType).toBe('question');
-    expect(passed[0].status).toBe('waiting');
+    expect(passed[0].status).toBe('pending');
+    expect(passed[0].parentId).toBeNull();
   });
 
-  it('既存質問があれば bulkCreate しない', async () => {
-    const repo: TreeNodeRepository = {
-      create: vi.fn(),
-      bulkCreate: vi.fn().mockResolvedValue([]),
-      findByGoal: vi.fn().mockResolvedValue([
-        { props: { nodeType: 'question' } } as never,
-      ]),
-      findById: vi.fn(),
-      updateStatus: vi.fn(),
-      updateLabel: vi.fn(),
-    };
-
+  it('既存の question があれば bulkCreate しない（冪等）', async () => {
+    const repo = makeRepo([{ props: { nodeType: 'question' } }]);
     await startHearing({
       goalId: VALID_GOAL,
       userId: VALID_USER,
-      treeNodeRepo: repo,
+      hearingNodeRepo: repo,
     });
-
     expect(repo.bulkCreate).not.toHaveBeenCalled();
   });
 });
@@ -2149,40 +2467,42 @@ describe('startHearing', () => {
 Run: `pnpm test tests/application/usecases/start-hearing.test.ts`
 Expected: FAIL。
 
-- [ ] **Step 5.5: StartHearing ユースケースを実装**
+- [ ] **Step 5.6: StartHearing ユースケースを実装**
 
 `src/application/usecases/start-hearing.ts`:
 
 ```ts
-import type { TreeNodeRepository } from '@/application/interfaces/tree-node-repository';
-import { NodeStatus } from '@/domain/enums/node-status';
-import { NodeType } from '@/domain/enums/node-type';
+import type { HearingNodeRepository } from '@/application/interfaces/hearing-node-repository';
+import { HearingNodeType } from '@/domain/enums/hearing-node-type';
+import { HearingStatus } from '@/domain/enums/hearing-status';
 import { MOCK_HEARING_QUESTIONS } from '@/infrastructure/mocks/question-bank';
 
 export interface StartHearingInput {
   goalId: string;
   userId: string;
-  treeNodeRepo: TreeNodeRepository;
+  hearingNodeRepo: HearingNodeRepository;
 }
 
 export async function startHearing(input: StartHearingInput): Promise<void> {
-  const existing = await input.treeNodeRepo.findByGoal(input.goalId);
+  const existing = await input.hearingNodeRepo.findByGoal(
+    input.goalId,
+    input.userId
+  );
   const hasQuestions = existing.some(
-    (n) => (n.props as { nodeType?: string }).nodeType === NodeType.Question
+    (n) => (n.props as { nodeType?: string }).nodeType === HearingNodeType.Question
   );
   if (hasQuestions) return;
 
-  await input.treeNodeRepo.bulkCreate(
+  await input.hearingNodeRepo.bulkCreate(
     MOCK_HEARING_QUESTIONS.map((q) => ({
       goalId: input.goalId,
       userId: input.userId,
       parentId: null,
       axisId: null,
-      nodeType: NodeType.Question,
+      nodeType: HearingNodeType.Question,
       label: q.label,
-      status: NodeStatus.Waiting,
-      depth: 0,
-      position: q.position,
+      status: HearingStatus.Pending,
+      sortOrder: q.position,
       metadata: { axis_position: q.axisPosition, ai_generated: false },
     }))
   );
@@ -2192,21 +2512,142 @@ export async function startHearing(input: StartHearingInput): Promise<void> {
 Run: `pnpm test tests/application/usecases/start-hearing.test.ts`
 Expected: PASS（2 件）。
 
-- [ ] **Step 5.6: RecordHearingAnswer / CompleteHearing ユースケースを書く**
+- [ ] **Step 5.7: RecordHearingAnswer のテストを書く（所有権境界の自動検証）**
+
+`tests/application/usecases/record-hearing-answer.test.ts`:
+
+```ts
+import { describe, expect, it, vi } from 'vitest';
+import { recordHearingAnswer } from '@/application/usecases/record-hearing-answer';
+import type { HearingNodeRepository } from '@/application/interfaces/hearing-node-repository';
+import { HearingNodeType } from '@/domain/enums/hearing-node-type';
+import { HearingStatus } from '@/domain/enums/hearing-status';
+
+const VALID_GOAL = '00000000-0000-7000-8000-000000000010';
+const OWNER_USER = '00000000-0000-7000-8000-000000000020';
+const OTHER_USER = '00000000-0000-7000-8000-000000000021';
+const QUESTION_ID = '00000000-0000-7000-8000-000000000030';
+
+const ownedQuestion = {
+  props: {
+    id: QUESTION_ID,
+    goalId: VALID_GOAL,
+    userId: OWNER_USER,
+    nodeType: HearingNodeType.Question,
+    status: HearingStatus.Pending,
+  },
+};
+
+function makeRepo(found: unknown | null): HearingNodeRepository {
+  return {
+    create: vi.fn().mockResolvedValue({ props: {} }),
+    bulkCreate: vi.fn(),
+    findByGoal: vi.fn(),
+    findById: vi.fn().mockResolvedValue(found),
+    updateStatus: vi.fn(),
+  };
+}
+
+describe('recordHearingAnswer', () => {
+  it('正常系: answer ノード作成 → question を answered に更新', async () => {
+    const repo = makeRepo(ownedQuestion);
+    await recordHearingAnswer({
+      goalId: VALID_GOAL,
+      userId: OWNER_USER,
+      questionNodeId: QUESTION_ID,
+      answerText: '初級',
+      hearingNodeRepo: repo,
+    });
+    expect(repo.create).toHaveBeenCalledOnce();
+    expect(repo.updateStatus).toHaveBeenCalledWith({
+      id: QUESTION_ID,
+      userId: OWNER_USER,
+      status: 'answered',
+    });
+  });
+
+  it('他ユーザーの question には書き込めない（findById が null を返す）', async () => {
+    const repo = makeRepo(null);
+    await expect(
+      recordHearingAnswer({
+        goalId: VALID_GOAL,
+        userId: OTHER_USER,
+        questionNodeId: QUESTION_ID,
+        answerText: 'X',
+        hearingNodeRepo: repo,
+      })
+    ).rejects.toThrow(/forbidden|not found/i);
+    expect(repo.create).not.toHaveBeenCalled();
+    expect(repo.updateStatus).not.toHaveBeenCalled();
+  });
+
+  it('question 以外のノード ID を渡したら拒否', async () => {
+    const repo = makeRepo({
+      props: { ...ownedQuestion.props, nodeType: HearingNodeType.Answer },
+    });
+    await expect(
+      recordHearingAnswer({
+        goalId: VALID_GOAL,
+        userId: OWNER_USER,
+        questionNodeId: QUESTION_ID,
+        answerText: 'X',
+        hearingNodeRepo: repo,
+      })
+    ).rejects.toThrow(/not a question/i);
+  });
+
+  it('別ゴールの question を指定したら拒否', async () => {
+    const repo = makeRepo({
+      props: {
+        ...ownedQuestion.props,
+        goalId: '00000000-0000-7000-8000-000000000099',
+      },
+    });
+    await expect(
+      recordHearingAnswer({
+        goalId: VALID_GOAL,
+        userId: OWNER_USER,
+        questionNodeId: QUESTION_ID,
+        answerText: 'X',
+        hearingNodeRepo: repo,
+      })
+    ).rejects.toThrow(/goal mismatch/i);
+  });
+
+  it('空の回答は拒否', async () => {
+    const repo = makeRepo(ownedQuestion);
+    await expect(
+      recordHearingAnswer({
+        goalId: VALID_GOAL,
+        userId: OWNER_USER,
+        questionNodeId: QUESTION_ID,
+        answerText: '   ',
+        hearingNodeRepo: repo,
+      })
+    ).rejects.toThrow(/empty/i);
+  });
+});
+```
+
+Run: `pnpm test tests/application/usecases/record-hearing-answer.test.ts`
+Expected: FAIL。
+
+- [ ] **Step 5.8: RecordHearingAnswer / CompleteHearing ユースケースを実装**
 
 `src/application/usecases/record-hearing-answer.ts`:
 
 ```ts
-import type { TreeNodeRepository } from '@/application/interfaces/tree-node-repository';
-import { NodeStatus } from '@/domain/enums/node-status';
-import { NodeType } from '@/domain/enums/node-type';
+import type { HearingNodeRepository } from '@/application/interfaces/hearing-node-repository';
+import { HearingNodeType } from '@/domain/enums/hearing-node-type';
+import { HearingStatus } from '@/domain/enums/hearing-status';
+import { DomainError } from '@/shared/errors/domain-error';
 
 export interface RecordHearingAnswerInput {
   goalId: string;
   userId: string;
   questionNodeId: string;
   answerText: string;
-  treeNodeRepo: TreeNodeRepository;
+  hearingNodeRepo: HearingNodeRepository;
 }
 
 export async function recordHearingAnswer(
@@ -2214,41 +2655,62 @@ export async function recordHearingAnswer(
 ): Promise<void> {
   const trimmed = input.answerText.trim();
   if (trimmed.length === 0) {
-    throw new Error('answer cannot be empty');
+    throw new DomainError('answer cannot be empty');
   }
 
-  await input.treeNodeRepo.create({
+  // 所有権 / 種別 / ゴール一致を application 層で明示検証する。
+  // RLS だけに頼ると、誤って service_role client を渡したときに防げないため。
+  const question = await input.hearingNodeRepo.findById(
+    input.questionNodeId,
+    input.userId
+  );
+  if (!question) {
+    throw new DomainError('question not found or forbidden');
+  }
+  const props = question.props as {
+    nodeType: string;
+    goalId: string;
+  };
+  if (props.nodeType !== HearingNodeType.Question) {
+    throw new DomainError('target node is not a question');
+  }
+  if (props.goalId !== input.goalId) {
+    throw new DomainError('question goal mismatch');
+  }
+
+  await input.hearingNodeRepo.create({
     goalId: input.goalId,
     userId: input.userId,
     parentId: input.questionNodeId,
     axisId: null,
-    nodeType: NodeType.Answer,
+    nodeType: HearingNodeType.Answer,
     label: trimmed,
-    status: NodeStatus.Completed,
-    depth: 1,
-    position: 1,
+    status: HearingStatus.Answered,
+    sortOrder: 1,
     metadata: {
       question_node_id: input.questionNodeId,
       answered_at: new Date().toISOString(),
     },
   });
 
-  await input.treeNodeRepo.updateStatus(
-    input.questionNodeId,
-    NodeStatus.Completed
-  );
+  await input.hearingNodeRepo.updateStatus({
+    id: input.questionNodeId,
+    userId: input.userId,
+    status: HearingStatus.Answered,
+  });
 }
 ```
 
 `src/application/usecases/complete-hearing.ts`:
 
 ```ts
-import type { TreeNodeRepository } from '@/application/interfaces/tree-node-repository';
-import { NodeType } from '@/domain/enums/node-type';
+import type { HearingNodeRepository } from '@/application/interfaces/hearing-node-repository';
+import { HearingNodeType } from '@/domain/enums/hearing-node-type';
 
 export interface CompleteHearingInput {
   goalId: string;
-  treeNodeRepo: TreeNodeRepository;
+  userId: string;
+  hearingNodeRepo: HearingNodeRepository;
 }
 
 export interface HearingResult {
@@ -2261,9 +2723,12 @@ export interface HearingResult {
 export async function completeHearing(
   input: CompleteHearingInput
 ): Promise<HearingResult[]> {
-  const nodes = await input.treeNodeRepo.findByGoal(input.goalId);
+  const nodes = await input.hearingNodeRepo.findByGoal(
+    input.goalId,
+    input.userId
+  );
   const questions = nodes.filter(
-    (n) => (n.props as { nodeType: string }).nodeType === NodeType.Question
+    (n) => (n.props as { nodeType: string }).nodeType === HearingNodeType.Question
   );
 
   return questions.map((q) => {
@@ -2274,64 +2739,63 @@ export async function completeHearing(
     };
     const answer = nodes.find(
       (a) =>
-        (a.props as { nodeType: string; parentId: string | null }).nodeType ===
-          NodeType.Answer &&
+        (a.props as { nodeType: string }).nodeType === HearingNodeType.Answer &&
         (a.props as { parentId: string | null }).parentId === props.id
     );
     return {
       questionId: props.id,
       questionLabel: props.label,
-      answerText: answer
-        ? (answer.props as { label: string }).label
-        : null,
+      answerText: answer ? (answer.props as { label: string }).label : null,
       axisPosition: props.metadata.axis_position as number | undefined,
     };
   });
 }
 ```
 
-- [ ] **Step 5.7: SupabaseTreeNodeRepository を実装**
+Run: `pnpm test tests/application/usecases/record-hearing-answer.test.ts`
+Expected: PASS（5 件）。
 
-`src/infrastructure/repositories/supabase-tree-node-repository.ts`:
+- [ ] **Step 5.9: SupabaseHearingNodeRepository を実装**
+
+`src/infrastructure/repositories/supabase-hearing-node-repository.ts`:
 
 ```ts
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type {
-  CreateTreeNodeInput,
-  TreeNodeRepository,
-} from '@/application/interfaces/tree-node-repository';
-import { TreeNode } from '@/domain/entities/tree-node';
-import type { NodeStatus } from '@/domain/enums/node-status';
-import type { NodeType } from '@/domain/enums/node-type';
+  CreateHearingNodeInput,
+  HearingNodeRepository,
+} from '@/application/interfaces/hearing-node-repository';
+import { HearingNode } from '@/domain/entities/hearing-node';
+import type { HearingNodeType } from '@/domain/enums/hearing-node-type';
+import type { HearingStatus } from '@/domain/enums/hearing-status';
 import type { Database } from '@/infrastructure/supabase/types';
 
-type Row = Database['public']['Tables']['tree_nodes']['Row'];
+type Row = Database['public']['Tables']['hearing_nodes']['Row'];
 
-function toDomain(row: Row): TreeNode {
-  return TreeNode.reconstruct({
+function toDomain(row: Row): HearingNode {
+  return HearingNode.reconstruct({
     id: row.id,
     goalId: row.goal_id,
     userId: row.user_id,
     parentId: row.parent_id,
     axisId: row.axis_id,
-    nodeType: row.node_type as NodeType,
+    nodeType: row.node_type as HearingNodeType,
     label: row.label,
-    status: row.status as NodeStatus,
-    depth: row.depth,
-    position: row.position,
+    status: row.status as HearingStatus,
     metadata: (row.metadata ?? {}) as Record<string, unknown>,
+    sortOrder: row.sort_order,
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at),
     deletedAt: row.deleted_at ? new Date(row.deleted_at) : null,
   });
 }
 
-export class SupabaseTreeNodeRepository implements TreeNodeRepository {
+export class SupabaseHearingNodeRepository implements HearingNodeRepository {
   constructor(private readonly db: SupabaseClient<Database>) {}
 
-  async create(input: CreateTreeNodeInput): Promise<TreeNode> {
+  async create(input: CreateHearingNodeInput): Promise<HearingNode> {
     const { data, error } = await this.db
-      .from('tree_nodes')
+      .from('hearing_nodes')
       .insert({
         goal_id: input.goalId,
         user_id: input.userId,
@@ -2340,8 +2804,7 @@ export class SupabaseTreeNodeRepository implements TreeNodeRepository {
         node_type: input.nodeType,
         label: input.label,
         status: input.status,
-        depth: input.depth,
-        position: input.position,
+        sort_order: input.sortOrder,
         metadata: input.metadata ?? {},
       })
       .select('*')
@@ -2350,10 +2813,10 @@ export class SupabaseTreeNodeRepository implements TreeNodeRepository {
     return toDomain(data);
   }
 
-  async bulkCreate(inputs: CreateTreeNodeInput[]): Promise<TreeNode[]> {
+  async bulkCreate(inputs: CreateHearingNodeInput[]): Promise<HearingNode[]> {
     if (inputs.length === 0) return [];
     const { data, error } = await this.db
-      .from('tree_nodes')
+      .from('hearing_nodes')
       .insert(
         inputs.map((i) => ({
           goal_id: i.goalId,
@@ -2363,8 +2826,7 @@ export class SupabaseTreeNodeRepository implements TreeNodeRepository {
           node_type: i.nodeType,
           label: i.label,
           status: i.status,
-          depth: i.depth,
-          position: i.position,
+          sort_order: i.sortOrder,
           metadata: i.metadata ?? {},
         }))
       )
@@ -2373,21 +2835,21 @@ export class SupabaseTreeNodeRepository implements TreeNodeRepository {
     return (data ?? []).map(toDomain);
   }
 
-  async findByGoal(goalId: string): Promise<TreeNode[]> {
+  async findByGoal(goalId: string, userId: string): Promise<HearingNode[]> {
     const { data, error } = await this.db
-      .from('tree_nodes')
+      .from('hearing_nodes')
       .select('*')
       .eq('goal_id', goalId)
+      .eq('user_id', userId)
       .is('deleted_at', null)
-      .order('depth')
-      .order('position');
+      .order('sort_order');
     if (error) throw error;
     return (data ?? []).map(toDomain);
   }
 
-  async findById(id: string, userId: string): Promise<TreeNode | null> {
+  async findById(id: string, userId: string): Promise<HearingNode | null> {
     const { data, error } = await this.db
-      .from('tree_nodes')
+      .from('hearing_nodes')
       .select('*')
       .eq('id', id)
       .eq('user_id', userId)
@@ -2397,25 +2859,22 @@ export class SupabaseTreeNodeRepository implements TreeNodeRepository {
     return data ? toDomain(data) : null;
   }
 
-  async updateStatus(id: string, status: NodeStatus): Promise<void> {
+  async updateStatus(input: {
+    id: string;
+    userId: string;
+    status: HearingStatus;
+  }): Promise<void> {
     const { error } = await this.db
-      .from('tree_nodes')
-      .update({ status })
-      .eq('id', id);
-    if (error) throw error;
-  }
-
-  async updateLabel(id: string, label: string): Promise<void> {
-    const { error } = await this.db
-      .from('tree_nodes')
-      .update({ label })
-      .eq('id', id);
+      .from('hearing_nodes')
+      .update({ status: input.status })
+      .eq('id', input.id)
+      .eq('user_id', input.userId);
     if (error) throw error;
   }
 }
 ```
 
-- [ ] **Step 5.8: Hearing Server Action を書く**
+- [ ] **Step 5.10: Hearing Server Action を書く**
 
 `src/presentation/actions/hearing.action.ts`:
 
@@ -2424,7 +2883,7 @@ export class SupabaseTreeNodeRepository implements TreeNodeRepository {
 import { revalidatePath } from 'next/cache';
 import { z } from 'zod';
 import { recordHearingAnswer } from '@/application/usecases/record-hearing-answer';
-import { SupabaseTreeNodeRepository } from '@/infrastructure/repositories/supabase-tree-node-repository';
+import { SupabaseHearingNodeRepository } from '@/infrastructure/repositories/supabase-hearing-node-repository';
 import { createSupabaseServerClient } from '@/infrastructure/supabase/server-client';
 
 const InputSchema = z.object({
@@ -2447,21 +2906,26 @@ export async function submitAnswer(formData: FormData) {
   } = await supabase.auth.getUser();
   if (!user) return { error: 'Unauthorized' };
 
-  const treeNodeRepo = new SupabaseTreeNodeRepository(supabase);
-  await recordHearingAnswer({
-    goalId: parsed.data.goalId,
-    userId: user.id,
-    questionNodeId: parsed.data.questionNodeId,
-    answerText: parsed.data.answerText,
-    treeNodeRepo,
-  });
+  const hearingNodeRepo = new SupabaseHearingNodeRepository(supabase);
+  try {
+    await recordHearingAnswer({
+      goalId: parsed.data.goalId,
+      userId: user.id,
+      questionNodeId: parsed.data.questionNodeId,
+      answerText: parsed.data.answerText,
+      hearingNodeRepo,
+    });
+  } catch (e) {
+    // application 層が forbidden / mismatch を投げる。攻撃可否を漏らさず一律 Forbidden に丸める。
+    return { error: 'Forbidden' };
+  }
 
   revalidatePath(`/hearing/${parsed.data.goalId}`);
   return { ok: true };
 }
 ```
 
-- [ ] **Step 5.9: Hearing ページを書く**
+- [ ] **Step 5.11: Hearing ページを書く**
 
 `src/app/hearing/[goalId]/page.tsx`:
 
@@ -2469,7 +2933,8 @@ export async function submitAnswer(formData: FormData) {
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { startHearing } from '@/application/usecases/start-hearing';
-import { SupabaseTreeNodeRepository } from '@/infrastructure/repositories/supabase-tree-node-repository';
+import { SupabaseGoalRepository } from '@/infrastructure/repositories/supabase-goal-repository';
+import { SupabaseHearingNodeRepository } from '@/infrastructure/repositories/supabase-hearing-node-repository';
 import { createSupabaseServerClient } from '@/infrastructure/supabase/server-client';
 import { submitAnswer } from '@/presentation/actions/hearing.action';
 
@@ -2484,17 +2949,22 @@ export default async function HearingPage({
   } = await supabase.auth.getUser();
   if (!user) redirect('/login');
 
-  const repo = new SupabaseTreeNodeRepository(supabase);
+  // 自分のゴールであることを確認（RLS と二重防御）。
+  const goalRepo = new SupabaseGoalRepository(supabase);
+  const goal = await goalRepo.findById(params.goalId, user.id);
+  if (!goal) redirect('/goals');
+
+  const hearingRepo = new SupabaseHearingNodeRepository(supabase);
   await startHearing({
     goalId: params.goalId,
     userId: user.id,
-    treeNodeRepo: repo,
+    hearingNodeRepo: hearingRepo,
   });
 
-  const nodes = await repo.findByGoal(params.goalId);
+  const nodes = await hearingRepo.findByGoal(params.goalId, user.id);
   const questions = nodes
     .filter((n) => n.props.nodeType === 'question')
-    .sort((a, b) => a.props.position - b.props.position);
+    .sort((a, b) => a.props.sortOrder - b.props.sortOrder);
   const answers = new Map(
     nodes
       .filter((n) => n.props.nodeType === 'answer')
@@ -2510,11 +2980,10 @@ export default async function HearingPage({
         {questions.map((q) => {
           const ans = answers.get(q.props.id);
           return (
-            <li
-              key={q.props.id}
-              className="rounded border p-4"
-            >
-              <p className="mb-2 font-medium">{q.props.position}. {q.props.label}</p>
+            <li key={q.props.id} className="rounded border p-4">
+              <p className="mb-2 font-medium">
+                {q.props.sortOrder}. {q.props.label}
+              </p>
               {ans ? (
                 <p className="text-sm text-gray-700">回答: {ans}</p>
               ) : (
@@ -2556,7 +3025,7 @@ export default async function HearingPage({
 }
 ```
 
-- [ ] **Step 5.10: 動作確認**
+- [ ] **Step 5.12: 動作確認**
 
 Run: `pnpm dev`
 
@@ -2565,15 +3034,16 @@ Run: `pnpm dev`
 2. 質問が 5 件表示される
 3. 順番に回答 → 全回答後「ツリーを生成する」ボタン表示
 4. ボタンをクリック → `/tree/<goalId>`（まだ存在しないので 404）にリダイレクト
+5. 別ユーザーの goalId を URL に直接入れる → `/goals` にリダイレクトされる
 
 Run: `pnpm test && pnpm typecheck && pnpm lint`
 Expected: 全 PASS、エラーゼロ。
 
-- [ ] **Step 5.11: コミット**
+- [ ] **Step 5.13: コミット**
 
 ```bash
-git add src/infrastructure/mocks/ src/application/interfaces/tree-node-repository.ts src/application/usecases/start-hearing.ts src/application/usecases/record-hearing-answer.ts src/application/usecases/complete-hearing.ts src/infrastructure/repositories/supabase-tree-node-repository.ts src/presentation/actions/hearing.action.ts src/app/hearing/ tests/application/usecases/start-hearing.test.ts
-git commit -m "feat(hearing): add mock-driven hearing flow with question/answer tree nodes"
+git add src/infrastructure/mocks/ src/domain/entities/hearing-node.ts src/domain/enums/hearing-node-type.ts src/domain/enums/hearing-status.ts src/application/interfaces/hearing-node-repository.ts src/application/usecases/start-hearing.ts src/application/usecases/record-hearing-answer.ts src/application/usecases/complete-hearing.ts src/infrastructure/repositories/supabase-hearing-node-repository.ts src/presentation/actions/hearing.action.ts src/app/hearing/ tests/domain/entities/hearing-node.test.ts tests/application/usecases/start-hearing.test.ts tests/application/usecases/record-hearing-answer.test.ts
+git commit -m "feat(hearing): add mock-driven hearing flow with HearingNode aggregate"
 ```
 
 ---
@@ -2618,6 +3088,171 @@ export const MOCK_TREE_TEMPLATE: readonly MockTreeMethod[] = [
     tasks: ['通知をオフにする時間帯を作る'],
   },
 ] as const;
+```
+
+- [ ] **Step 6.1.5: TreeNodeRepository インターフェース宣言**
+
+`src/application/interfaces/tree-node-repository.ts`:
+
+```ts
+import type { TreeNode } from '@/domain/entities/tree-node';
+import type { NodeStatus } from '@/domain/enums/node-status';
+
+export interface CreateTreeNodeInput {
+  goalId: string;
+  userId: string;
+  parentId: string | null;
+  axisId: string | null;
+  nodeType: 'goal' | 'sub_goal' | 'method' | 'task';
+  label: string;
+  status: NodeStatus;
+  depth: number;
+  position: number;
+  metadata: Record<string, unknown>;
+}
+
+export interface TreeNodeRepository {
+  create(input: CreateTreeNodeInput): Promise<TreeNode>;
+  bulkCreate(inputs: CreateTreeNodeInput[]): Promise<TreeNode[]>;
+  /**
+   * userId 必須。所有権境界はリポジトリ実装側で `eq('user_id', userId)` を強制し、
+   * RLS が緩む / service_role 経由でアクセスされるケースに備えた多層防御とする（I1 fix）。
+   */
+  findById(id: string, userId: string): Promise<TreeNode | null>;
+  findByGoal(goalId: string): Promise<TreeNode[]>;
+  /**
+   * userId 必須。第二条件として WHERE 句に user_id = $userId を追加すること。
+   * これにより、誤って他ユーザーの node id を渡されても update が空ヒットになる。
+   */
+  updateStatus(id: string, userId: string, status: NodeStatus): Promise<void>;
+  updateLabel(id: string, userId: string, label: string): Promise<void>;
+}
+```
+
+- [ ] **Step 6.1.7: SupabaseTreeNodeRepository を実装**
+
+`src/infrastructure/repositories/supabase-tree-node-repository.ts`:
+
+```ts
+import type { SupabaseClient } from '@supabase/supabase-js';
+import type {
+  CreateTreeNodeInput,
+  TreeNodeRepository,
+} from '@/application/interfaces/tree-node-repository';
+import { TreeNode } from '@/domain/entities/tree-node';
+import type { NodeStatus } from '@/domain/enums/node-status';
+import type { Database } from '@/infrastructure/supabase/types';
+
+type Row = Database['public']['Tables']['tree_nodes']['Row'];
+type Insert = Database['public']['Tables']['tree_nodes']['Insert'];
+
+function toDomain(row: Row): TreeNode {
+  return TreeNode.reconstruct({
+    id: row.id,
+    goalId: row.goal_id,
+    userId: row.user_id,
+    parentId: row.parent_id,
+    axisId: row.axis_id,
+    nodeType: row.node_type as 'goal' | 'sub_goal' | 'method' | 'task',
+    label: row.label,
+    status: row.status as NodeStatus,
+    depth: row.depth,
+    position: row.position,
+    metadata: (row.metadata ?? {}) as Record<string, unknown>,
+    createdAt: new Date(row.created_at),
+    updatedAt: new Date(row.updated_at),
+    deletedAt: row.deleted_at ? new Date(row.deleted_at) : null,
+  });
+}
+
+function toInsert(input: CreateTreeNodeInput): Insert {
+  return {
+    goal_id: input.goalId,
+    user_id: input.userId,
+    parent_id: input.parentId,
+    axis_id: input.axisId,
+    node_type: input.nodeType,
+    label: input.label,
+    status: input.status,
+    depth: input.depth,
+    position: input.position,
+    metadata: input.metadata,
+  };
+}
+
+export class SupabaseTreeNodeRepository implements TreeNodeRepository {
+  constructor(private readonly db: SupabaseClient<Database>) {}
+
+  async create(input: CreateTreeNodeInput): Promise<TreeNode> {
+    const { data, error } = await this.db
+      .from('tree_nodes')
+      .insert(toInsert(input))
+      .select('*')
+      .single();
+    if (error || !data) throw error ?? new Error('insert returned no row');
+    return toDomain(data);
+  }
+
+  async bulkCreate(inputs: CreateTreeNodeInput[]): Promise<TreeNode[]> {
+    if (inputs.length === 0) return [];
+    const { data, error } = await this.db
+      .from('tree_nodes')
+      .insert(inputs.map(toInsert))
+      .select('*');
+    if (error) throw error;
+    return (data ?? []).map(toDomain);
+  }
+
+  async findById(id: string, userId: string): Promise<TreeNode | null> {
+    const { data, error } = await this.db
+      .from('tree_nodes')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', userId) // 多層防御: RLS が落ちても user_id 不一致は弾く
+      .is('deleted_at', null)
+      .maybeSingle();
+    if (error) throw error;
+    return data ? toDomain(data) : null;
+  }
+
+  async findByGoal(goalId: string): Promise<TreeNode[]> {
+    const { data, error } = await this.db
+      .from('tree_nodes')
+      .select('*')
+      .eq('goal_id', goalId)
+      .is('deleted_at', null)
+      .order('depth')
+      .order('position');
+    if (error) throw error;
+    return (data ?? []).map(toDomain);
+  }
+
+  async updateStatus(
+    id: string,
+    userId: string,
+    status: NodeStatus
+  ): Promise<void> {
+    const { error } = await this.db
+      .from('tree_nodes')
+      .update({ status })
+      .eq('id', id)
+      .eq('user_id', userId); // userId 条件を必須にし、誤って他ユーザー行を更新しない
+    if (error) throw error;
+  }
+
+  async updateLabel(
+    id: string,
+    userId: string,
+    label: string
+  ): Promise<void> {
+    const { error } = await this.db
+      .from('tree_nodes')
+      .update({ label })
+      .eq('id', id)
+      .eq('user_id', userId);
+    if (error) throw error;
+  }
+}
 ```
 
 - [ ] **Step 6.2: GenerateMockTree のテストを書く**
@@ -2997,7 +3632,7 @@ git commit -m "feat(tree): add idempotent mock tree generation with Goal-Method-
 - Create: `src/app/today/page.tsx`
 - Test: `tests/application/usecases/complete-task.test.ts`
 
-設計上の注意: v0.1 のジェスチャーは「上スワイプ」と「キーボード Enter」のみ。横スワイプ・端タップ・取消スタックは v0.3 へ。`task_logs` の UNIQUE INDEX `(user_id, task_node_id, completed_on)` で同日二重記録を防ぐ。
+設計上の注意: v0.1 のジェスチャーは「上スワイプ」と「キーボード Enter」のみ。横スワイプ・端タップ・取消スタックは v0.3 へ。`task_logs` の UNIQUE INDEX `(user_id, node_id, completed_on)` で同日二重記録を防ぐ。
 
 - [ ] **Step 7.1: TaskLog Repository インターフェースを定義**
 
@@ -3229,7 +3864,7 @@ function toDomain(row: Row): TaskLog {
   return TaskLog.reconstruct({
     id: row.id,
     userId: row.user_id,
-    taskNodeId: row.task_node_id,
+    taskNodeId: row.node_id,
     completedAt: new Date(row.completed_at),
     dayStartHourAtCompletion: row.day_start_hour_at_completion,
     timezoneAtCompletion: row.timezone_at_completion,
@@ -3248,13 +3883,13 @@ export class SupabaseTaskLogRepository implements TaskLogRepository {
       .upsert(
         {
           user_id: input.userId,
-          task_node_id: input.taskNodeId,
+          node_id: input.taskNodeId,
           completed_at: input.completedAt.toISOString(),
           day_start_hour_at_completion: input.dayStartHour,
           timezone_at_completion: input.timezone,
           note: input.note,
         },
-        { onConflict: 'user_id,task_node_id,completed_on' }
+        { onConflict: 'user_id,node_id,completed_on' }
       )
       .select('*')
       .single();
@@ -3271,7 +3906,7 @@ export class SupabaseTaskLogRepository implements TaskLogRepository {
       .from('task_logs')
       .delete()
       .eq('user_id', input.userId)
-      .eq('task_node_id', input.taskNodeId)
+      .eq('node_id', input.taskNodeId)
       .eq('completed_on', input.logicalDate);
     if (error) throw error;
   }
@@ -3469,10 +4104,12 @@ export function TaskCard({ taskNodeId, label, completed }: TaskCardProps) {
 'use server';
 import { revalidatePath } from 'next/cache';
 import { z } from 'zod';
+import { NodeType } from '@/domain/tree/node-type';
 import { completeTask } from '@/application/usecases/complete-task';
 import { uncompleteTask } from '@/application/usecases/uncomplete-task';
 import { SupabaseProfileRepository } from '@/infrastructure/repositories/supabase-profile-repository';
 import { SupabaseTaskLogRepository } from '@/infrastructure/repositories/supabase-task-log-repository';
+import { SupabaseTreeNodeRepository } from '@/infrastructure/repositories/supabase-tree-node-repository';
 import { createSupabaseServerClient } from '@/infrastructure/supabase/server-client';
 
 const InputSchema = z.object({ taskNodeId: z.string().uuid() });
@@ -3488,6 +4125,12 @@ export async function completeTaskAction(formData: FormData) {
     data: { user },
   } = await supabase.auth.getUser();
   if (!user) return { error: 'Unauthorized' };
+
+  // 所有権 & ノード型検証（多層防御: RLS + アプリ層）
+  const treeRepo = new SupabaseTreeNodeRepository(supabase);
+  const node = await treeRepo.findById(parsed.data.taskNodeId, user.id);
+  if (!node) return { error: 'Forbidden' };
+  if (node.props.nodeType !== NodeType.Task) return { error: 'Not a task' };
 
   const profileRepo = new SupabaseProfileRepository(supabase);
   const taskLogRepo = new SupabaseTaskLogRepository(supabase);
@@ -3514,6 +4157,12 @@ export async function uncompleteTaskAction(formData: FormData) {
   } = await supabase.auth.getUser();
   if (!user) return { error: 'Unauthorized' };
 
+  // 所有権 & ノード型検証
+  const treeRepo = new SupabaseTreeNodeRepository(supabase);
+  const node = await treeRepo.findById(parsed.data.taskNodeId, user.id);
+  if (!node) return { error: 'Forbidden' };
+  if (node.props.nodeType !== NodeType.Task) return { error: 'Not a task' };
+
   const profileRepo = new SupabaseProfileRepository(supabase);
   const taskLogRepo = new SupabaseTaskLogRepository(supabase);
 
@@ -3527,6 +4176,8 @@ export async function uncompleteTaskAction(formData: FormData) {
   return { ok: true };
 }
 ```
+
+> **所有権検証の意図**: form 由来の `taskNodeId` を `completeTask` / `uncompleteTask` ユースケースへ渡す前に、ノードが認証ユーザーに属し、かつ `task` 型であることを確認する。RLS は最後の防衛線だが、誤って service_role client を使った場合や repository の `updateStatus(id, status)` のように userId 条件のない API を使った場合に備え、アプリケーション層でも明示的に検証する。
 
 - [ ] **Step 7.10: Today ページを書く**
 
@@ -3636,26 +4287,51 @@ git commit -m "feat(today): add daily task view with up-swipe gesture and idempo
 - `pnpm dev` 起動済み
 - ブラウザで `http://localhost:3000` を開く
 - Supabase Studio の Inbucket: `http://127.0.0.1:54324`
+- 検証用に 2 つのメールアドレスを用意する（`alice@test.local`, `bob@test.local`）
 
-## シナリオ
+## シナリオ（基本フロー: alice）
 1. ✅ `/` → `/login` にリダイレクトされる
-2. ✅ メールアドレスを入力して送信、Inbucket でリンクをクリック → `/goals` に着く
+2. ✅ alice でメール送信、Inbucket でリンクをクリック → `/goals` に着く
 3. ✅ `/goals` で「新しいゴール」を押す → `/goals/new` に遷移
-4. ✅ ラベル「英語を流暢に話せるようになる」で作成 → `/hearing/<goalId>` に遷移
+4. ✅ ラベル「英語を流暢に話せるようになる」で作成 → `/hearing/<goalId_a>` に遷移
+   - 内部で `create_goal_with_axes` RPC が走り、`goals` 1 行 + `framework_axes` 4 行が同時に入ること（SQL Studio で確認）
 5. ✅ 5 つの質問に順番に回答 → 全て答えると「ツリーを生成する」ボタンが現れる
-6. ✅ ボタン押下 → `/tree/<goalId>` に遷移、Goal-Method-Task の 3 層が表示される
+6. ✅ ボタン押下 → `/tree/<goalId_a>` に遷移、Goal-Method-Task の 3 層が表示される
 7. ✅ ページ再読み込みしてもツリーが重複生成されない
 8. ✅ 「今日のタスクへ」を押す → `/today` に遷移、タスクカード 4 件が並ぶ
 9. ✅ カードを上スワイプ → 完了状態になる
 10. ✅ ページ再読み込み → 完了状態維持
 11. ✅ 完了カードに Tab フォーカスして Enter → 取消され、再度上スワイプで完了できる
-12. ✅ SQL Studio で `select user_id, task_node_id, completed_on from task_logs;` 実行 → 同日同タスクが 1 行に正規化されている
+12. ✅ SQL Studio で `select user_id, node_id, completed_on from task_logs;` 実行 → 同日同タスクが 1 行に正規化されている
+
+## シナリオ（クロスユーザー RLS 検証: bob と alice の分離）
+
+> **意図**: アプリケーション層の所有権チェックと RLS の二段構えが、別ユーザーのリソースを完全に遮断していることを確認する（I6 fix）。
+
+13. ✅ alice からログアウト後、bob でログインする
+14. ✅ bob の `/goals` で alice の goal が**見えない**（`SupabaseGoalRepository.findByUser` の `eq('user_id', userId)` + RLS）
+15. ✅ bob で URL に alice の goalId を直接入れる:
+    - `/hearing/<goalId_a>` → `/goals` に redirect（HearingPage の `goalRepo.findById(id, user.id)` が null を返す）
+    - `/tree/<goalId_a>` → 同様に redirect
+    - `/today?goalId=<goalId_a>` → 同様に redirect（または bob 自身の今日のタスクのみ表示）
+16. ✅ bob の DevTools で `/today` の `completeTaskAction` を直接叩いて alice の `taskNodeId` を送る
+    - サーバーアクションは `treeRepo.findById(taskNodeId, bob.id)` が null になるため `{ error: 'Forbidden' }` を返す
+    - `task_logs` に bob による alice ノードの行は**入らない**こと（SQL Studio で確認）
+17. ✅ SQL Studio で **anon ロール** として実行（`set role anon; set request.jwt.claims = '{"sub":"<bob_uuid>"}'`）:
+    - `select * from goals where user_id = '<alice_uuid>'` → 0 行
+    - `select * from hearing_nodes where user_id = '<alice_uuid>'` → 0 行
+    - `select * from tree_nodes where user_id = '<alice_uuid>'` → 0 行
+    - `select * from task_logs where user_id = '<alice_uuid>'` → 0 行
+    - `reset role;` で戻す
 
 ## 不合格条件
 - いずれかのページで例外が出る
 - ツリーが重複する
 - task_logs の同日二重行が出る
 - ログアウト状態で /goals 等にアクセスして見えてしまう
+- **bob のセッションで alice の goal/hearing/tree/task_logs が 1 行でも見える**
+- **bob の completeTaskAction が alice の taskNodeId に対して `{ ok: true }` を返す**
+- **anon ロール経由で別ユーザーの行が SELECT できる**
 ```
 
 - [ ] **Step 8.2: 全体テスト・lint・typecheck の最終確認**
